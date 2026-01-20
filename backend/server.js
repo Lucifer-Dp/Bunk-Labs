@@ -1,21 +1,17 @@
 import express from 'express'
 import cors from 'cors'
-import fs from 'fs'
-import path from 'path'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
-import { fileURLToPath } from 'url'
 import dotenv from 'dotenv'
+import pkg from 'pg'
 
 dotenv.config()
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
 
 const app = express()
 const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'bunklab_dev_secret_change_in_production'
 const NODE_ENV = process.env.NODE_ENV || 'development'
+const DATABASE_URL = process.env.DATABASE_URL
 
 // CORS configuration
 const corsOrigins = process.env.CORS_ORIGINS 
@@ -28,24 +24,35 @@ app.use(cors({
 }))
 app.use(express.json())
 
-const dataDir = path.join(__dirname, 'data')
-const usersFile = path.join(dataDir, 'users.json')
-
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true })
+// --- Database (Postgres) ---
+const { Pool } = pkg
+if (!DATABASE_URL) {
+  console.warn('DATABASE_URL not set. Set it to your Neon connection string.')
 }
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false,
+})
 
-if (!fs.existsSync(usersFile)) {
-  fs.writeFileSync(usersFile, JSON.stringify([]))
-}
-
-const readUsers = () => {
-  const raw = fs.readFileSync(usersFile, 'utf-8')
-  return JSON.parse(raw)
-}
-
-const writeUsers = (users) => {
-  fs.writeFileSync(usersFile, JSON.stringify(users, null, 2))
+// Ensure users table exists
+const ensureUsersTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      points INT DEFAULT 0,
+      rank INT,
+      level INT DEFAULT 1,
+      login_streak INT DEFAULT 0,
+      last_login_date TIMESTAMPTZ,
+      tagline TEXT,
+      college TEXT,
+      avatar TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `)
 }
 
 const createToken = (user) =>
@@ -75,34 +82,28 @@ app.post('/api/auth/signup', async (req, res) => {
     return res.status(400).json({ message: 'Name, email and password are required' })
   }
 
-  const users = readUsers()
-  if (users.find((u) => u.email === email)) {
-    return res.status(409).json({ message: 'Email already registered' })
+  try {
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email])
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ message: 'Email already registered' })
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10)
+
+    const insert = await pool.query(
+      `INSERT INTO users (name, email, password_hash, points, rank, level, login_streak, last_login_date, tagline, college, avatar)
+       VALUES ($1,$2,$3,0,NULL,1,0,NULL,'','', '👨‍💻')
+       RETURNING id, name, email, points, rank, level, login_streak AS "loginStreak", last_login_date AS "lastLoginDate", tagline, college, avatar`,
+      [name, email, passwordHash]
+    )
+
+    const user = insert.rows[0]
+    const token = createToken(user)
+    res.status(201).json({ user, token })
+  } catch (err) {
+    console.error('Signup error', err)
+    res.status(500).json({ message: 'Server error during signup' })
   }
-
-  const passwordHash = await bcrypt.hash(password, 10)
-
-  const newUser = {
-    id: Date.now().toString(),
-    name,
-    email,
-    passwordHash,
-    points: 0,
-    rank: null,
-    level: 1,
-    loginStreak: 0,
-    lastLoginDate: null,
-    tagline: '',
-    college: '',
-    avatar: '👨‍💻',
-  }
-
-  users.push(newUser)
-  writeUsers(users)
-
-  const token = createToken(newUser)
-  const { passwordHash: _, ...safeUser } = newUser
-  res.status(201).json({ user: safeUser, token })
 })
 
 app.post('/api/auth/login', async (req, res) => {
@@ -111,35 +112,61 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(400).json({ message: 'Email and password are required' })
   }
 
-  const users = readUsers()
-  const user = users.find((u) => u.email === email)
-  if (!user) {
-    return res.status(401).json({ message: 'Invalid credentials' })
-  }
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, password_hash, points, rank, level, login_streak AS "loginStreak", last_login_date AS "lastLoginDate", tagline, college, avatar
+       FROM users WHERE email = $1`,
+      [email]
+    )
+    if (result.rowCount === 0) {
+      return res.status(401).json({ message: 'Invalid credentials' })
+    }
 
-  const ok = await bcrypt.compare(password, user.passwordHash)
-  if (!ok) {
-    return res.status(401).json({ message: 'Invalid credentials' })
-  }
+    const user = result.rows[0]
+    const ok = await bcrypt.compare(password, user.password_hash)
+    if (!ok) {
+      return res.status(401).json({ message: 'Invalid credentials' })
+    }
 
-  const token = createToken(user)
-  const { passwordHash: _, ...safeUser } = user
-  res.json({ user: safeUser, token })
+    delete user.password_hash
+    const token = createToken(user)
+    res.json({ user, token })
+  } catch (err) {
+    console.error('Login error', err)
+    res.status(500).json({ message: 'Server error during login' })
+  }
 })
 
 app.get('/api/user/me', authMiddleware, (req, res) => {
-  const users = readUsers()
-  const user = users.find((u) => u.id === req.user.id)
-  if (!user) return res.status(404).json({ message: 'User not found' })
-  const { passwordHash: _, ...safeUser } = user
-  res.json({ user: safeUser })
+  pool
+    .query(
+      `SELECT id, name, email, points, rank, level, login_streak AS "loginStreak", last_login_date AS "lastLoginDate", tagline, college, avatar
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    )
+    .then((result) => {
+      if (result.rowCount === 0) return res.status(404).json({ message: 'User not found' })
+      res.json({ user: result.rows[0] })
+    })
+    .catch((err) => {
+      console.error('Get user error', err)
+      res.status(500).json({ message: 'Server error' })
+    })
 })
 
-app.listen(PORT, () => {
-  console.log(`🚀 Bunk Lab backend listening on http://localhost:${PORT}`)
-  console.log(`📦 Environment: ${NODE_ENV}`)
-  if (NODE_ENV === 'production') {
-    console.log(`🔒 CORS enabled for: ${corsOrigins.join(', ')}`)
-  }
-})
+// Start server after ensuring table exists
+ensureUsersTable()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`🚀 Bunk Lab backend listening on http://localhost:${PORT}`)
+      console.log(`📦 Environment: ${NODE_ENV}`)
+      if (NODE_ENV === 'production') {
+        console.log(`🔒 CORS enabled for: ${corsOrigins.join(', ')}`)
+      }
+    })
+  })
+  .catch((err) => {
+    console.error('Failed to ensure users table', err)
+    process.exit(1)
+  })
 
