@@ -16,7 +16,8 @@ const DATABASE_URL = process.env.DATABASE_URL
 // CORS configuration
 const corsOrigins = process.env.CORS_ORIGINS 
   ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
-  : ['http://localhost:5173', 'http://localhost:3000']
+  : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000']
+
 
 app.use(cors({ 
   origin: NODE_ENV === 'production' ? corsOrigins : corsOrigins,
@@ -26,13 +27,81 @@ app.use(express.json())
 
 // --- Database (Postgres) ---
 const { Pool } = pkg
+
+let pool
+
 if (!DATABASE_URL) {
-  console.warn('DATABASE_URL not set. Set it to your Neon connection string.')
+  console.warn('DATABASE_URL not set. Using in-memory mock database.')
+  
+  // In-memory store
+  const users = []
+  
+  pool = {
+    query: async (text, params) => {
+      const sql = text.replace(/\s+/g, ' ').trim().toUpperCase()
+      
+      // Mock CREATE TABLE
+      if (sql.startsWith('CREATE TABLE')) {
+        return { rowCount: 0 }
+      }
+      
+      // Mock SELECT (Login/Me/Duplicate check)
+      if (sql.includes('FROM USERS WHERE EMAIL = $1') || sql.includes('FROM USERS WHERE ID = $1')) {
+        const isEmail = sql.includes('EMAIL = $1')
+        const user = users.find(u => isEmail ? u.email === params[0] : u.id === params[0])
+        
+        if (!user) return { rowCount: 0, rows: [] }
+        
+        // Return with aliases used in the app
+        return { 
+          rowCount: 1, 
+          rows: [{
+            ...user,
+            loginStreak: user.login_streak,
+            lastLoginDate: user.last_login_date
+          }] 
+        }
+      }
+      
+      // Mock INSERT (Signup)
+      if (sql.startsWith('INSERT INTO USERS')) {
+        const newUser = {
+          id: Math.random().toString(36).substring(2, 15),
+          name: params[0],
+          email: params[1],
+          password_hash: params[2],
+          points: 0,
+          rank: null,
+          level: 1,
+          login_streak: 0,
+          last_login_date: null,
+          tagline: '',
+          college: '',
+          avatar: '👨‍💻',
+          created_at: new Date()
+        }
+        
+        users.push(newUser)
+        
+        return { 
+          rowCount: 1, 
+          rows: [{
+            ...newUser,
+            loginStreak: newUser.login_streak,
+            lastLoginDate: newUser.last_login_date
+          }] 
+        }
+      }
+      
+      return { rowCount: 0, rows: [] }
+    }
+  }
+} else {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  })
 }
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false,
-})
 
 // Ensure users table exists
 const ensureUsersTable = async () => {
