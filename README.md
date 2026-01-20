@@ -110,14 +110,14 @@ Make sure to set environment variables in your hosting platform.
 ```
 The Bunk Lab/
 ├── backend/              # Node.js/Express backend
-│   ├── server.js         # Main server file
-│   ├── data/             # JSON data storage
-│   └── package.json
+├── server.js         # Main server file
+├── data/             # JSON data storage
+└── package.json
 ├── src/                  # React frontend
-│   ├── components/       # Reusable components
-│   ├── pages/            # Page components
-│   ├── utils/            # Utility functions (API)
-│   └── App.jsx           # Main app component
+├── components/       # Reusable components
+├── pages/            # Page components
+├── utils/            # Utility functions (API)
+└── App.jsx           # Main app component
 ├── dist/                 # Built frontend (generated)
 └── package.json          # Frontend dependencies
 ```
